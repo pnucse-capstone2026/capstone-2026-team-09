@@ -23,8 +23,13 @@ try:
         if not ok:
             continue
         ts = int((time.time() - t0) * 1000)
-        f = an.analyze_bgr(bgr, ts)
-        agg.push(f)
+        FPS = 10.0
+        _last = 0.0
+        now = time.time()
+        if now - _last >= 1.0 / FPS:
+            _last = now
+            f = an.analyze_bgr(bgr, int((now - t0) * 1000))
+            agg.push(f)
 
         now = time.time()
         if f and now - last_print > 0.5:

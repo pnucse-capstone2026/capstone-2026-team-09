@@ -18,7 +18,7 @@ EXPR_KEYS = [
     "browDownLeft", "browDownRight", "browInnerUp",
     "eyeSquintLeft", "eyeSquintRight", "eyeWideLeft", "eyeWideRight",
     "mouthSmileLeft", "mouthSmileRight", "mouthFrownLeft", "mouthFrownRight",
-    "mouthPressLeft", "mouthPressRight", "mouthPucker", "jawOpen",
+    "mouthPressLeft", "mouthPressRight", "mouthPucker"
 ]
 
 # 두부 회전 행렬 전치 여부. smoke_test.py 로 검증 후 필요하면 True 로 바꾼다.

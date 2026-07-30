@@ -6,7 +6,8 @@ GAZE_YAW_TOL = 15.0       # 캘리브레이션 정면 대비 좌우 허용 각�
 GAZE_PITCH_TOL = 12.0     # 상하 허용 각도(deg)
 EYE_DEV_TOL = 0.35        # 안구 이탈 블렌드셰이프 허용치(0~1)
 BLINK_ON = 0.5            # 이 값을 상향 돌파하면 눈깜빡임 1회
-FACE_TOUCH_RADIUS = 0.55  # 어깨너비 배수. 코 기준 이 반경 안에 손목이 오면 '얼굴 만짐'
+FACE_TOUCH_RADIUS = 0.35  # 어깨너비 배수.
+FACE_TOUCH_DWELL_SEC = 1 # 이 시간 이상 머물러야 1회로 인정
 WRIST_VIS_TOL = 0.5       # 손목 visibility 하한
 MIN_FRAMES = 5            # 이보다 적으면 턴 집계 포기
 FRAME_MARGIN = 0.04        # 정규화 좌표 이 안쪽만 '프레임 안'으로 인정
@@ -106,9 +107,10 @@ class SessionAggregator:
 
         # ── 3. 손짓 ───────────────────────────────────────────────
         used, pts, touches = 0, [], 0
-        was_touching = False
         speeds = []            # 폐기 예정이나 CSV 기록용으로 유지
         prev = None
+        touch_start = None
+        touch_counted = False
 
         for f in pose:
             sw = f["shoulder_w"]
@@ -133,9 +135,16 @@ class SessionAggregator:
                 _in_frame(f[k]) and
                 math.hypot(f[k][0] - f["nose"][0], f[k][1] - f["nose"][1]) < r
                 for k in ("lw", "rw"))
-            if touching and not was_touching:
-                touches += 1
-            was_touching = touching
+            if touching:
+                if touch_start is None:
+                    touch_start = f["ts"]
+                elif not touch_counted and \
+                        (f["ts"] - touch_start) / 1000.0 >= FACE_TOUCH_DWELL_SEC:
+                    touches += 1
+                    touch_counted = True
+            else:
+                touch_start = None
+                touch_counted = False
             prev = f
 
         usage = used / len(pose) if pose else 0.0
