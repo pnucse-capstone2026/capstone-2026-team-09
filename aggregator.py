@@ -9,7 +9,21 @@ BLINK_ON = 0.5            # 이 값을 상향 돌파하면 눈깜빡임 1회
 FACE_TOUCH_RADIUS = 0.55  # 어깨너비 배수. 코 기준 이 반경 안에 손목이 오면 '얼굴 만짐'
 WRIST_VIS_TOL = 0.5       # 손목 visibility 하한
 MIN_FRAMES = 5            # 이보다 적으면 턴 집계 포기
+FRAME_MARGIN = 0.04        # 정규화 좌표 이 안쪽만 '프레임 안'으로 인정
+HAND_HEIGHT_LIMIT = 1.2    # 어깨선 아래로 어깨너비의 이 배수까지만 '사용 중'으로 인정
+                           # (무릎/책상 위 손을 제외하기 위함. 0 = 어깨선, 크면 관대)
 
+def _in_frame(p) -> bool:
+    """MediaPipe 는 프레임 밖 관절도 추정값을 내므로 경계로 직접 판정한다."""
+    return (FRAME_MARGIN <= p[0] <= 1 - FRAME_MARGIN and
+            FRAME_MARGIN <= p[1] <= 1 - FRAME_MARGIN)
+
+
+def _hand_in_use(wrist, torso_y: float, sw: float) -> bool:
+    """프레임 안에 있고, 어깨선 기준 너무 아래(무릎/책상)가 아닌 손목."""
+    if not _in_frame(wrist):
+        return False
+    return wrist[1] <= torso_y + HAND_HEIGHT_LIMIT * sw   # y는 아래로 증가
 
 class SessionAggregator:
     def __init__(self):
@@ -91,26 +105,47 @@ class SessionAggregator:
             tilt_mean = sway = drift = 0.0
 
         # ── 3. 손짓 ───────────────────────────────────────────────
-        energy, touches, visible = 0.0, 0, 0
-        was_touching, prev = False, None
+        used, pts, touches = 0, [], 0
+        was_touching = False
+        speeds = []            # 폐기 예정이나 CSV 기록용으로 유지
+        prev = None
+
         for f in pose:
             sw = f["shoulder_w"]
-            if f["lw_vis"] >= WRIST_VIS_TOL or f["rw_vis"] >= WRIST_VIS_TOL:
-                visible += 1
+            l_use = _hand_in_use(f["lw"], f["torso_y"], sw)
+            r_use = _hand_in_use(f["rw"], f["torso_y"], sw)
+            if l_use or r_use:
+                used += 1
+            if l_use: pts.append(f["lw"])
+            if r_use: pts.append(f["rw"])
+
             if prev is not None:
                 dt = max((f["ts"] - prev["ts"]) / 1000.0, 1e-3)
-                d = (math.hypot(f["lw"][0] - prev["lw"][0], f["lw"][1] - prev["lw"][1]) +
-                     math.hypot(f["rw"][0] - prev["rw"][0], f["rw"][1] - prev["rw"][1])) / 2
-                energy += (d / sw) / dt
+                ds = [math.hypot(f[k][0] - prev[k][0], f[k][1] - prev[k][1])
+                      for k in ("lw", "rw")
+                      if _in_frame(f[k]) and _in_frame(prev[k])]
+                if ds:
+                    speeds.append((sum(ds) / len(ds) / sw) / dt)
+
+            # 얼굴 만지기 (진입 에지에서만 1회)
             r = FACE_TOUCH_RADIUS * sw
-            touching = (
-                math.hypot(f["lw"][0] - f["nose"][0], f["lw"][1] - f["nose"][1]) < r or
-                math.hypot(f["rw"][0] - f["nose"][0], f["rw"][1] - f["nose"][1]) < r)
+            touching = any(
+                _in_frame(f[k]) and
+                math.hypot(f[k][0] - f["nose"][0], f[k][1] - f["nose"][1]) < r
+                for k in ("lw", "rw"))
             if touching and not was_touching:
                 touches += 1
             was_touching = touching
             prev = f
-        energy /= max(len(pose) - 1, 1)
+
+        usage = used / len(pose) if pose else 0.0
+        if pts:
+            arr = np.array(pts)
+            extent = float(math.hypot(arr[:, 0].std(), arr[:, 1].std())
+                           / (b["shoulder_w"] or 0.25))
+        else:
+            extent = 0.0
+        energy = float(np.percentile(speeds, 80)) if speeds else 0.0
 
         # ── 4. 표정 ───────────────────────────────────────────────
         if face:
@@ -141,8 +176,10 @@ class SessionAggregator:
             "shoulderTiltMean": round(tilt_mean, 2),
             "bodySwayStd": round(sway, 4),
             "torsoDriftMean": round(drift, 4),
-            "handMotionEnergy": round(energy, 4),
-            "handVisibleRatio": round(visible / len(pose), 3) if pose else 0.0,
+            "handUsageRatio": round(usage, 3),
+            "handExtent": round(extent, 4),
+            "faceTouchCount": touches,
+            "handMotionEnergy": round(energy, 4),   # 폐기됨. 분석용 기록만
             "faceTouchCount": touches,
             "expressionVariance": round(expr_var, 4),
             "smileRatio": round(smile_ratio, 3),
