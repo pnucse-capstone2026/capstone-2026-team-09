@@ -134,7 +134,3 @@ class FrameAnalyzer:
                 nose=(float(lm[NOSE].x), float(lm[NOSE].y)),
             )
         return out
-
-    def analyze_jpeg(self, jpeg: bytes, ts_ms: int) -> dict | None:
-        bgr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-        return self.analyze_bgr(bgr, ts_ms)
