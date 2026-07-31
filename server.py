@@ -4,11 +4,14 @@ from contextlib import asynccontextmanager
 
 import cv2
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from analyzer import FrameAnalyzer
 from aggregator import SessionAggregator
+
+load_dotenv()
 
 # ── 환경변수 설정 ────────────────────────────────────────────────
 BACKEND_URL  = os.getenv("BACKEND_URL", "http://127.0.0.1:8080")
