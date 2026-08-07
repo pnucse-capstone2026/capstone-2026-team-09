@@ -204,14 +204,15 @@ setInterval(async()=>{
 
 # ── 실험 로그 + 백엔드 전송 ──────────────────────────────────────
 def _dump_csv(session_id: str, features: dict):
+    """실험 분석용 원시 피쳐 로그. 회차 구분을 위해 기록 시각을 앞에 붙인다."""
+    row = {"recordedAt": time.strftime("%Y-%m-%d %H:%M:%S"), **features}
     path = LOG_DIR / f"{session_id}.csv"
     new = not path.exists()
     with path.open("a", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=list(features.keys()))
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
         if new:
             w.writeheader()
-        w.writerow(features)
-
+        w.writerow(row)
 
 async def _post_features(session_id: str, features: dict):
     _dump_csv(session_id, features)
