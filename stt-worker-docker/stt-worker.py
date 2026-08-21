@@ -20,6 +20,22 @@ app = FastAPI()
 # TTS Worker WebSocket URL
 TTS_WORKER_WS_URL = os.getenv("TTS_WORKER_WS_URL", "ws://host.docker.internal:8001/ws/tts")
 
+# Checkpoint 전사 설정. 기존 최종 전사 경로와 분리한다.
+CHECKPOINT_ENABLED = os.getenv("CHECKPOINT_ENABLED", "true").lower() == "true"
+CHECKPOINT_TRIGGER_BYTES = int(os.getenv("CHECKPOINT_TRIGGER_BYTES", "16000"))  # 0.5초
+CHECKPOINT_MIN_BYTES = int(os.getenv("CHECKPOINT_MIN_BYTES", "25600"))          # 0.8초
+CHECKPOINT_WINDOW_BYTES = int(os.getenv("CHECKPOINT_WINDOW_BYTES", "96000"))   # 3초
+
+# correction_request는 호환성을 위해 코드와 메시지 형식은 유지하되 완전 비활성화한다.
+# 신뢰도 확률은 0~1 범위이므로 threshold=0.0이면 조건을 만족할 수 없다.
+CORRECTION_CONFIDENCE_THRESHOLD = 0.0
+
+# checkpoint 확정과 Unity VAD 종료 신호를 분리한다.
+# 기존 동작이 필요한 실험에서는 환경변수로 true를 줄 수 있다.
+EMIT_ADAPTIVE_VAD_TRIGGER = os.getenv(
+    "EMIT_ADAPTIVE_VAD_TRIGGER", "false"
+).lower() == "true"
+
 # Faster-Whisper 모델 로드
 base_dir = os.path.dirname(os.path.abspath(__file__))
 whisper_model_path = os.path.join(base_dir, "model", "whisper")
@@ -64,15 +80,31 @@ class AudioState:
         self.last_partial_trigger_byte = 0  # 마지막으로 부분 전사를 실행했을 때의 버퍼 크기
         self.last_eos_trigger_byte = 0      # 마지막으로 문장 종결 신호를 보냈을 때의 버퍼 크기
 
-    def reset(self):
-        """부분 전사 태스크를 무효화하고 현재 발화 상태를 초기화합니다."""
+        # 마지막으로 확정한 checkpoint 이후의 전사 구간
+        self.checkpoint_start_byte = 0
+        self.last_checkpoint_sent_byte = 0
+        self.partial_seq = 0
+        self.checkpoint_texts = []
+        self.partial_enabled = True
+
+    def invalidate_inference(self):
+        """진행 중인 후보/checkpoint 추론 결과가 도착해도 무효화한다."""
         self.epoch += 1
         if self.inference_task is not None and not self.inference_task.done():
             self.inference_task.cancel()
         self.inference_task = None
+
+    def reset(self):
+        """부분 전사 태스크를 무효화하고 현재 발화 상태를 초기화합니다."""
+        self.invalidate_inference()
         self.full_pcm_buffer.clear()
         self.last_partial_trigger_byte = 0
         self.last_eos_trigger_byte = 0
+        self.checkpoint_start_byte = 0
+        self.last_checkpoint_sent_byte = 0
+        self.partial_seq = 0
+        self.checkpoint_texts.clear()
+        self.partial_enabled = True
 
 
 # Faster-Whisper 모델 객체에 대한 부분 전사와 최종 batch 전사의 동시 접근 방지용 Lock
@@ -122,16 +154,30 @@ def transcribe_for_sentence_detection(audio_np):
         word_timestamps=False, # 종결 감지용이므로 타임스탬프 생략(속도 향상)
     )
 
-async def detect_sentence_completion(state, websocket, session_id):
-    """[수정됨] Sliding Window 방식: 전체 오디오가 아닌 최근 N초 구간만 추출하여 종결 감지"""
+def transcribe_checkpoint(audio_np):
+    """마지막 checkpoint 이후 구간을 batch 전사한다.
+
+    결과는 주제 이탈 판정용 초안이며, 최종 채점에는 사용하지 않는다.
+    """
+    return _transcribe_segments(
+        audio_np,
+        language="ko",
+        beam_size=2,
+        condition_on_previous_text=False,
+        vad_filter=True,
+        word_timestamps=False,
+    )
+
+async def detect_sentence_completion(state, websocket, session_id, send_partial):
+    """문장 종결 후보를 찾고, 마지막 확정 지점 이후 구간을 batch checkpoint 전사한다."""
+    if not CHECKPOINT_ENABLED or not state.partial_enabled:
+        return
+
     current_epoch = state.epoch
     buffer_len = len(state.full_pcm_buffer)
-    
-    # 윈도우 크기: 최근 3초 (16000Hz * 2bytes * 3sec = 96,000 bytes)
-    SLIDING_WINDOW_BYTES = 96000
-    
+
     # 전체 버퍼에서 최근 3초 분량만 잘라냄 (앞부분은 버리고 뒷부분 유지 = 문맥 유지 및 연산량 고정)
-    start_idx = max(0, buffer_len - SLIDING_WINDOW_BYTES)
+    start_idx = max(0, buffer_len - CHECKPOINT_WINDOW_BYTES)
     audio_slice = bytes(state.full_pcm_buffer[start_idx:])
     audio_np = np.frombuffer(audio_slice, dtype=np.int16).astype(np.float32) / 32768.0
 
@@ -141,15 +187,67 @@ async def detect_sentence_completion(state, websocket, session_id):
     )
 
     # 추론 도중 새로운 발화(reset)가 시작되었거나 텍스트가 없으면 종료
-    if state.epoch != current_epoch or not detected_text:
+    if (
+        state.epoch != current_epoch
+        or not state.partial_enabled
+        or not detected_text
+    ):
         return
 
-    if is_sentence_completed(detected_text):
-        # 중복 트리거 방지: 이전에 종결 신호를 보낸 후 1초(32000 bytes) 분량의 새로운 오디오가 없다면 무시
-        if buffer_len - state.last_eos_trigger_byte > 32000:
-            state.last_eos_trigger_byte = buffer_len
-            print(f"[{session_id}] Sentence completion detected: '{detected_text}'")
-            await websocket.send_json({"type": "adaptive_vad_trigger", "is_completed": True})
+    if not is_sentence_completed(detected_text):
+        return
+
+    # 같은 지점의 반복 후보를 막는다.
+    if state.last_eos_trigger_byte and buffer_len - state.last_eos_trigger_byte <= 32000:
+        return
+    state.last_eos_trigger_byte = buffer_len
+
+    segment_start = state.checkpoint_start_byte
+    segment_bytes = buffer_len - segment_start
+    if segment_bytes < CHECKPOINT_MIN_BYTES:
+        return
+
+    checkpoint_slice = bytes(state.full_pcm_buffer[segment_start:buffer_len])
+    checkpoint_np = np.frombuffer(checkpoint_slice, dtype=np.int16).astype(np.float32) / 32768.0
+    checkpoint_text, _ = await asyncio.to_thread(
+        transcribe_checkpoint,
+        checkpoint_np,
+    )
+
+    if (
+        state.epoch != current_epoch
+        or not state.partial_enabled
+        or not checkpoint_text
+        or not is_sentence_completed(checkpoint_text)
+        or buffer_len <= state.last_checkpoint_sent_byte
+    ):
+        return
+
+    cumulative = " ".join((*state.checkpoint_texts, checkpoint_text)).strip()
+    payload = {
+        "type": "partial_transcript",
+        "session_id": session_id,
+        "seq": state.partial_seq + 1,
+        "sentence": checkpoint_text,
+        "cumulative": cumulative,
+    }
+
+    if not await send_partial(payload):
+        print(f"[{session_id}] partial_transcript 전송 실패 - checkpoint 보류")
+        return
+
+    state.partial_seq += 1
+    state.checkpoint_texts.append(checkpoint_text)
+    state.checkpoint_start_byte = buffer_len
+    state.last_checkpoint_sent_byte = buffer_len
+    print(
+        f"[{session_id}] Checkpoint #{state.partial_seq}: "
+        f"'{checkpoint_text}'"
+    )
+
+    # 기존 Unity VAD 종료 임계값 변경은 checkpoint와 분리한다.
+    if EMIT_ADAPTIVE_VAD_TRIGGER:
+        await websocket.send_json({"type": "adaptive_vad_trigger", "is_completed": True})
 
 @app.websocket("/ws/interview")
 async def websocket_endpoint(websocket: WebSocket):
@@ -159,6 +257,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     state = AudioState()
     tts_ws = None
+    tts_send_lock = asyncio.Lock()
 
     async def get_or_connect_tts_ws():
         nonlocal tts_ws
@@ -169,6 +268,22 @@ async def websocket_endpoint(websocket: WebSocket):
             except Exception as e:
                 tts_ws = None
         return tts_ws
+
+    async def send_partial_to_backend(payload):
+        """기존 /ws/tts 연결로 checkpoint만 전달한다. TTS 생성은 백엔드가 하지 않는다."""
+        nonlocal tts_ws
+        for _ in range(2):
+            try:
+                ws = await get_or_connect_tts_ws()
+                if ws is None:
+                    raise RuntimeError("TTS backend WebSocket is unavailable")
+                async with tts_send_lock:
+                    await ws.send(json.dumps(payload, ensure_ascii=False))
+                return True
+            except Exception as e:
+                print(f"[{session_id}] partial_transcript 전송 실패: {e}")
+                tts_ws = None
+        return False
 
     async def tts_relay_loop():
         nonlocal tts_ws
@@ -198,7 +313,14 @@ async def websocket_endpoint(websocket: WebSocket):
     relay_task = asyncio.create_task(tts_relay_loop())
 
     def spawn_sentence_detection_task():
-        task = asyncio.create_task(detect_sentence_completion(state, websocket, session_id))
+        task = asyncio.create_task(
+            detect_sentence_completion(
+                state,
+                websocket,
+                session_id,
+                send_partial_to_backend,
+            )
+        )
         state.inference_task = task
         def clear_task(done_task):
             if state.inference_task is done_task:
@@ -221,10 +343,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 state.full_pcm_buffer.extend(pcm_payload)
 
-                # [수정됨] 0.5초(16000 바이트)마다 부분 전사 트리거 실행
+                # 0.5초마다 문장 종결 후보를 확인한다.
                 unprocessed_for_partial = len(state.full_pcm_buffer) - state.last_partial_trigger_byte
                 if (
-                    unprocessed_for_partial >= 16000 
+                    CHECKPOINT_ENABLED
+                    and state.partial_enabled
+                    and unprocessed_for_partial >= CHECKPOINT_TRIGGER_BYTES
                     and (state.inference_task is None or state.inference_task.done())
                 ):
                     state.last_partial_trigger_byte = len(state.full_pcm_buffer)
@@ -233,6 +357,9 @@ async def websocket_endpoint(websocket: WebSocket):
             elif "text" in message:
                 data = json.loads(message["text"])
                 msg_type = data.get("type")
+                final_text = ""
+                features = {}
+                truncated = False
 
                 if msg_type == "discard":
                     state.reset()
@@ -266,7 +393,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         except: pass
                         continue
 
-                elif msg_type == "utterance_end":
+                elif msg_type in ("utterance_end", "utterance_abort"):
+                    is_abort = msg_type == "utterance_abort"
+                    truncated = is_abort
                     features = data.get("features")
                     if not isinstance(features, dict):
                         features = {}
@@ -275,7 +404,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     except (TypeError, ValueError):
                         speaking_time = 0.0
 
-                    if not math.isfinite(speaking_time) or speaking_time <= 0.0:
+                    if (
+                        not is_abort
+                        and (not math.isfinite(speaking_time) or speaking_time <= 0.0)
+                    ):
                         state.reset()
                         try: await websocket.send_json({"type": "stt_skip", "reason": "invalid_speaking_time"})
                         except: pass
@@ -287,7 +419,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         except: pass
                         continue
 
-                    if state.inference_task is not None:
+                    if is_abort:
+                        # 개입 확정 이후에는 늦게 끝난 checkpoint가 결과를 보내지 못하게 한다.
+                        state.partial_enabled = False
+                        state.invalidate_inference()
+                    elif state.inference_task is not None:
                         partial_task = state.inference_task
                         try:
                             await asyncio.gather(partial_task, return_exceptions=True)
@@ -332,7 +468,13 @@ async def websocket_endpoint(websocket: WebSocket):
                             "responseTime": features.get("responseTime", 0.0) if features else 0.0
                         }
 
-                        if not is_correction and avg_confidence < 0.75:
+                        # correction_request는 호환성을 위해 로직을 보존하지만
+                        # 임계값 0.0에서는 절대 발생하지 않는다.
+                        if (
+                            not is_correction
+                            and CORRECTION_CONFIDENCE_THRESHOLD > 0.0
+                            and avg_confidence < CORRECTION_CONFIDENCE_THRESHOLD
+                        ):
                             words_list = [w["word"] for w in words_info]
                             confidences_list = [w["probability"] for w in words_info]
                             state.reset()
@@ -344,6 +486,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             })
                             continue
 
+                        final_dto["truncated"] = is_abort
                         state.reset()
                         await websocket.send_json({"type": "final", "data": final_dto})
 
@@ -363,11 +506,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         try:
                             ws = await get_or_connect_tts_ws()
                             if ws is not None:
-                                await ws.send(json.dumps({
-                                    "text": final_text,
-                                    "session_id": session_id,
-                                    "features": features if features else {}
-                                }))
+                                async with tts_send_lock:
+                                    await ws.send(json.dumps({
+                                        "text": final_text,
+                                        "session_id": session_id,
+                                        "features": features if features else {},
+                                        "truncated": truncated,
+                                    }))
                                 sent_successfully = True
                                 break
                             else:
