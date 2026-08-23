@@ -13,6 +13,15 @@ MIN_FRAMES = 5            # 이보다 적으면 턴 집계 포기
 FRAME_MARGIN = 0.04        # 정규화 좌표 이 안쪽만 '프레임 안'으로 인정
 HAND_HEIGHT_LIMIT = 1.2    # 어깨선 아래로 어깨너비의 이 배수까지만 '사용 중'으로 인정
                            # (무릎/책상 위 손을 제외하기 위함. 0 = 어깨선, 크면 관대)
+MIN_FRAMES = 5             # 이보다 적으면 턴 집계 포기
+MIN_FRAMES_REACTION = 3    # REACTION 구간은 2~5초로 짧다. 임계를 낮춘다.
+
+_MIN_FRAMES_BY_PHASE = {
+    "NORMAL": MIN_FRAMES,
+    "TRUNCATED": MIN_FRAMES,
+    "REACTION": MIN_FRAMES_REACTION,
+    "REANSWER": MIN_FRAMES,
+}
 
 def _in_frame(p) -> bool:
     """MediaPipe 는 프레임 밖 관절도 추정값을 내므로 경계로 직접 판정한다."""
@@ -34,6 +43,7 @@ class SessionAggregator:
         self.calibrating = False
         self.in_turn = False
         self.stage = ""
+        self.phase = "NORMAL" 
 
     # ---------- 캘리브레이션 ----------
     def start_calibration(self):
@@ -57,9 +67,10 @@ class SessionAggregator:
         return self.baseline
 
     # ---------- 턴 ----------
-    def start_turn(self, stage: str = ""):
+    def start_turn(self, stage: str = "", phase: str = "NORMAL"):
         self.in_turn = True
         self.stage = stage
+        self.phase = phase or "NORMAL"
         self._frames.clear()
 
     def push(self, frame: dict | None):
@@ -70,11 +81,16 @@ class SessionAggregator:
         elif self.in_turn:
             self._frames.append(frame)
 
-    def end_turn(self) -> dict | None:
+    def end_turn(self, phase_override: str = "") -> dict | None:
         self.in_turn = False
+        if phase_override:
+            self.phase = phase_override      # 개입으로 잘린 구간의 위상 정정
         fr = self._frames
         n = len(fr)
-        if n < MIN_FRAMES:
+        min_frames = _MIN_FRAMES_BY_PHASE.get(self.phase, MIN_FRAMES)
+        if n < min_frames:
+            print(f"[Aggregator] 프레임 부족으로 집계 스킵 "
+                  f"stage={self.stage} phase={self.phase} frames={n} < {min_frames}")
             return None
 
         dur = max((fr[-1]["ts"] - fr[0]["ts"]) / 1000.0, 1e-6)
@@ -174,6 +190,7 @@ class SessionAggregator:
 
         return {
             "stage": self.stage,
+            "phase": self.phase,
             "durationSec": round(dur, 2),
             "frameCount": n,
             "faceDetectedRatio": round(len(face) / n, 3),
@@ -189,9 +206,10 @@ class SessionAggregator:
             "handExtent": round(extent, 4),
             "faceTouchCount": touches,
             "handMotionEnergy": round(energy, 4),   # 폐기됨. 분석용 기록만
-            "faceTouchCount": touches,
             "expressionVariance": round(expr_var, 4),
             "smileRatio": round(smile_ratio, 3),
             "frownRatio": round(frown_ratio, 3),
             "blinkPerMinute": round(bpm, 1),
         }
+
+    
