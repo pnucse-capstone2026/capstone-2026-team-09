@@ -94,6 +94,14 @@ Node B(TTS)에서 온 44.1kHz, Mono, 32-bit Float PCM 오디오 데이터를 유
 #### 4.2 .env 파일 형식
 1. stt-worker-docker 폴더내의 .env  
 TTS_WORKER_URL = http://host.docker.internal:8001/process(노드 B의 주소)
+
+   문장 단위 checkpoint를 백엔드 변경 없이 검증하려면 다음 항목을 추가한다.
+   ```env
+   CHECKPOINT_ENABLED=true
+   CHECKPOINT_BACKEND_ENABLED=false
+   CHECKPOINT_LOG_PATH=./logs/checkpoints.jsonl
+   ```
+   이 모드에서는 checkpoint가 `utterance_id`, `seq`, `sentence`, `cumulative`를 포함한 JSONL로 기록된다. 기본값은 기존 백엔드 전달 동작을 유지한다.
 2. tts-worker-docker 폴더내의 .env  
 GROQ_API_KEY = groq api 키  
 MODEL_NAME = 사용할 모델 (예: openai/gpt-oss-20b)  

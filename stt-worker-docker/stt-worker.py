@@ -6,6 +6,7 @@ import re
 import asyncio
 import math
 import threading
+import uuid
 import numpy as np
 import httpx
 import websockets
@@ -25,6 +26,8 @@ CHECKPOINT_ENABLED = os.getenv("CHECKPOINT_ENABLED", "true").lower() == "true"
 CHECKPOINT_TRIGGER_BYTES = int(os.getenv("CHECKPOINT_TRIGGER_BYTES", "16000"))  # 0.5초
 CHECKPOINT_MIN_BYTES = int(os.getenv("CHECKPOINT_MIN_BYTES", "25600"))          # 0.8초
 CHECKPOINT_WINDOW_BYTES = int(os.getenv("CHECKPOINT_WINDOW_BYTES", "96000"))   # 3초
+CHECKPOINT_LOG_PATH = os.getenv("CHECKPOINT_LOG_PATH", "")
+CHECKPOINT_BACKEND_ENABLED = os.getenv("CHECKPOINT_BACKEND_ENABLED", "true").lower() == "true"
 
 # correction_request는 호환성을 위해 코드와 메시지 형식은 유지하되 완전 비활성화한다.
 # 신뢰도 확률은 0~1 범위이므로 threshold=0.0이면 조건을 만족할 수 없다.
@@ -75,6 +78,7 @@ class AudioState:
         self.full_pcm_buffer = bytearray()
         self.inference_task = None
         self.epoch = 0
+        self.utterance_id = uuid.uuid4().hex
         
         # [수정됨] Sliding Window 및 트리거 관리를 위한 변수
         self.last_partial_trigger_byte = 0  # 마지막으로 부분 전사를 실행했을 때의 버퍼 크기
@@ -98,6 +102,7 @@ class AudioState:
         """부분 전사 태스크를 무효화하고 현재 발화 상태를 초기화합니다."""
         self.invalidate_inference()
         self.full_pcm_buffer.clear()
+        self.utterance_id = uuid.uuid4().hex
         self.last_partial_trigger_byte = 0
         self.last_eos_trigger_byte = 0
         self.checkpoint_start_byte = 0
@@ -109,6 +114,21 @@ class AudioState:
 
 # Faster-Whisper 모델 객체에 대한 부분 전사와 최종 batch 전사의 동시 접근 방지용 Lock
 model_inference_lock = threading.Lock()
+
+def append_checkpoint_log(event: dict) -> bool:
+    """백엔드 없이 checkpoint/abort 결과를 JSONL로 남긴다."""
+    if not CHECKPOINT_LOG_PATH:
+        return False
+
+    try:
+        parent = os.path.dirname(os.path.abspath(CHECKPOINT_LOG_PATH))
+        os.makedirs(parent, exist_ok=True)
+        with open(CHECKPOINT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        return True
+    except Exception as e:
+        print(f"[checkpoint] 로컬 로그 기록 실패: {e}")
+        return False
 
 def _transcribe_segments(audio_np, **kwargs):
     with model_inference_lock:
@@ -200,7 +220,6 @@ async def detect_sentence_completion(state, websocket, session_id, send_partial)
     # 같은 지점의 반복 후보를 막는다.
     if state.last_eos_trigger_byte and buffer_len - state.last_eos_trigger_byte <= 32000:
         return
-    state.last_eos_trigger_byte = buffer_len
 
     segment_start = state.checkpoint_start_byte
     segment_bytes = buffer_len - segment_start
@@ -227,21 +246,25 @@ async def detect_sentence_completion(state, websocket, session_id, send_partial)
     payload = {
         "type": "partial_transcript",
         "session_id": session_id,
+        "utterance_id": state.utterance_id,
         "seq": state.partial_seq + 1,
         "sentence": checkpoint_text,
         "cumulative": cumulative,
     }
 
-    if not await send_partial(payload):
+    logged_locally = append_checkpoint_log(payload)
+    sent_to_backend = await send_partial(payload)
+    if not sent_to_backend and not logged_locally:
         print(f"[{session_id}] partial_transcript 전송 실패 - checkpoint 보류")
         return
 
     state.partial_seq += 1
     state.checkpoint_texts.append(checkpoint_text)
+    state.last_eos_trigger_byte = buffer_len
     state.checkpoint_start_byte = buffer_len
     state.last_checkpoint_sent_byte = buffer_len
     print(
-        f"[{session_id}] Checkpoint #{state.partial_seq}: "
+        f"[{session_id}/{state.utterance_id}] Checkpoint #{state.partial_seq}: "
         f"'{checkpoint_text}'"
     )
 
@@ -272,6 +295,9 @@ async def websocket_endpoint(websocket: WebSocket):
     async def send_partial_to_backend(payload):
         """기존 /ws/tts 연결로 checkpoint만 전달한다. TTS 생성은 백엔드가 하지 않는다."""
         nonlocal tts_ws
+        if not CHECKPOINT_BACKEND_ENABLED:
+            return False
+
         for _ in range(2):
             try:
                 ws = await get_or_connect_tts_ws()
@@ -360,6 +386,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 final_text = ""
                 features = {}
                 truncated = False
+                utterance_id = state.utterance_id
 
                 if msg_type == "discard":
                     state.reset()
@@ -374,6 +401,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     pause_cnt = features.get("meaningfulPauseCount", features.get("pauseCount", 0)) if features else 0
                     final_dto = {
                         "sttText": text_to_send,
+                        "utterance_id": utterance_id,
                         "speakingTime": features.get("speakingTime", 0.0) if features else 0.0,
                         "pauseCount": pause_cnt,
                         "meaningfulPauseCount": pause_cnt,
@@ -459,6 +487,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         pause_cnt = features.get("meaningfulPauseCount", features.get("pauseCount", 0)) if features else 0
                         final_dto = {
                             "sttText": final_text,
+                            "utterance_id": utterance_id,
                             "speakingTime": features.get("speakingTime", 0.0) if features else 0.0,
                             "pauseCount": pause_cnt,
                             "meaningfulPauseCount": pause_cnt,
@@ -487,6 +516,14 @@ async def websocket_endpoint(websocket: WebSocket):
                             continue
 
                         final_dto["truncated"] = is_abort
+                        if is_abort:
+                            append_checkpoint_log({
+                                "type": "final",
+                                "session_id": session_id,
+                                "utterance_id": utterance_id,
+                                "truncated": True,
+                                "text": final_text,
+                            })
                         state.reset()
                         await websocket.send_json({"type": "final", "data": final_dto})
 
@@ -510,6 +547,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     await ws.send(json.dumps({
                                         "text": final_text,
                                         "session_id": session_id,
+                                        "utterance_id": utterance_id,
                                         "features": features if features else {},
                                         "truncated": truncated,
                                     }))
