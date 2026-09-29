@@ -535,7 +535,7 @@ C
 
 ### 6.2. 시연 영상
 
-[![VRoom 시연 영상](http://img.youtube.com/vi/{동영상 ID}/0.jpg)](https://www.youtube.com/watch?v={동영상 ID})
+[![VRoom 시연 영상](http://img.youtube.com/vi/gfc1GAbzRvw/0.jpg)](https://www.youtube.com/watch?v=gfc1GAbzRvw)
 
 ---
 
